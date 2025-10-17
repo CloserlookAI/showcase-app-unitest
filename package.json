@@ -1,0 +1,17 @@
+{
+  "name": "unitest",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 8002 -H 0.0.0.0",
+    "build": "next build",
+    "start": "next start -p 8002 -H 0.0.0.0"
+  },
+  "dependencies": {
+    "@vercel/og": "^0.8.5",
+    "marked": "^12.0.2",
+    "next": "14.2.3",
+    "react": "18.2.0",
+    "react-dom": "18.2.0"
+  }
+}
