@@ -44,8 +44,12 @@ function formatCommentary(commentary) {
   return `${cleaned.slice(0, 137)}…`;
 }
 
-function renderOutputItems(items) {
+function renderOutputItems(items, isChat = false) {
   if (!Array.isArray(items) || items.length === 0) {
+    if (isChat) {
+      // For chat messages, don't show error if no output yet
+      return null;
+    }
     return (
       <p className="output-panel__error">
         The agent did not return any test results.
@@ -92,6 +96,126 @@ export default function RepoTestPage({ owner, name, repoUrl, agentName, response
   const [isPolling, setIsPolling] = useState(() => Boolean(derivedResponseId && !isTerminal((normalizedInitial?.status) || 'pending')));
   const [pollError, setPollError] = useState(null);
 
+  // Chat state
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const [isSendingChat, setIsSendingChat] = useState(false);
+  const [currentChatResponseId, setCurrentChatResponseId] = useState(null);
+  const [isChatPolling, setIsChatPolling] = useState(false);
+  const [isChatHistoryLoaded, setIsChatHistoryLoaded] = useState(false);
+
+  // Load chat history from agent responses on mount
+  useEffect(() => {
+    if (!derivedAgentName || !derivedResponseId || isChatHistoryLoaded) {
+      return;
+    }
+
+    const loadChatHistory = async () => {
+      try {
+        // Fetch all responses for this agent
+        const allResponsesRes = await fetch(`/api/ra/agents/${encodeURIComponent(derivedAgentName)}/responses`);
+        if (!allResponsesRes.ok) {
+          setIsChatHistoryLoaded(true);
+          return;
+        }
+
+        const allResponses = await allResponsesRes.json();
+
+        // Filter to only show followup chat messages (not initial test generation)
+        const chatResponses = Array.isArray(allResponses)
+          ? allResponses.filter(r => {
+              if (!r || !r.id) return false;
+
+              // Skip the current/initial response
+              if (r.id === derivedResponseId) return false;
+
+              // Extract user's input using input_content (per API docs)
+              const inputContent = r.input_content?.[0]?.content || '';
+
+              // Filter out the initial test generation prompt
+              // It contains "Clone" and "**Step 1:" keywords and is very long
+              if (inputContent.length > 500 ||
+                  (inputContent.includes('Clone') && inputContent.includes('**Step 1:'))) {
+                return false;
+              }
+
+              return true;
+            }).sort((a, b) => {
+              // Sort by created_at ascending (oldest first)
+              const dateA = new Date(a.created_at || 0);
+              const dateB = new Date(b.created_at || 0);
+              return dateA - dateB;
+            })
+          : [];
+
+        // Convert responses to chat messages
+        const messages = [];
+        for (const resp of chatResponses) {
+          if (!resp || !resp.id) continue;
+
+          // Extract user message using input_content (per API docs)
+          let userContent = '';
+          if (resp.input_content && Array.isArray(resp.input_content) && resp.input_content.length > 0) {
+            const firstContent = resp.input_content[0];
+            if (firstContent && typeof firstContent.content === 'string') {
+              userContent = firstContent.content;
+            }
+          }
+
+          // Skip if we couldn't extract a valid user message
+          if (!userContent || userContent.trim().length === 0) continue;
+
+          // Add user message
+          messages.push({
+            id: `user-${resp.id}`,
+            type: 'user',
+            content: userContent,
+            timestamp: resp.created_at || new Date().toISOString()
+          });
+
+          // Check if this response timed out (status is still pending/processing and response is old)
+          let finalStatus = resp.status;
+          const responseAge = new Date() - new Date(resp.created_at);
+          const isStale = responseAge > 3600000; // 1 hour old
+
+          if ((resp.status === 'pending' || resp.status === 'processing') && isStale) {
+            // Likely timed out - check if agent is sleeping
+            try {
+              const agentStateRes = await fetch(`/api/ra/agents/${encodeURIComponent(derivedAgentName)}/state`);
+              if (agentStateRes.ok) {
+                const agentData = await agentStateRes.json();
+                if (agentData.state === 'slept') {
+                  finalStatus = 'busy_timeout';
+                }
+              }
+            } catch (stateErr) {
+              console.error('[UniTest] Error checking agent state during history load:', stateErr);
+            }
+          }
+
+          // Add agent response
+          messages.push({
+            id: resp.id,
+            type: 'agent',
+            content: userContent,
+            timestamp: resp.updated_at || resp.created_at || new Date().toISOString(),
+            response: normalizeResponse(resp),
+            status: finalStatus,
+            agentState: finalStatus === 'busy_timeout' ? 'slept' : undefined
+          });
+        }
+
+        setChatMessages(messages);
+        setIsChatHistoryLoaded(true);
+      } catch (error) {
+        console.error('[UniTest] Error loading chat history:', error);
+        setIsChatHistoryLoaded(true);
+      }
+    };
+
+    loadChatHistory();
+  }, [derivedAgentName, derivedResponseId, isChatHistoryLoaded]);
+
   // Poll for response updates every 3 seconds
   useEffect(() => {
     if (!derivedAgentName || !derivedResponseId || !isPolling) {
@@ -127,6 +251,132 @@ export default function RepoTestPage({ owner, name, repoUrl, agentName, response
       clearInterval(interval);
     };
   }, [derivedAgentName, derivedResponseId, isPolling]);
+
+  // Poll for chat response updates every 3 seconds
+  useEffect(() => {
+    if (!derivedAgentName || !currentChatResponseId || !isChatPolling) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/ra/responses/${encodeURIComponent(derivedAgentName)}/${encodeURIComponent(currentChatResponseId)}`);
+        if (!res.ok) {
+          throw new Error(`Chat polling failed with status ${res.status}`);
+        }
+        const data = normalizeResponse(await res.json());
+        if (!cancelled && data) {
+          // Check if response is pending for too long - might indicate agent sleep
+          if (data.status === 'pending' || data.status === 'processing') {
+            // Check agent state
+            try {
+              const agentStateRes = await fetch(`/api/ra/agents/${encodeURIComponent(derivedAgentName)}/state`);
+              if (agentStateRes.ok) {
+                const agentData = await agentStateRes.json();
+                // If agent is sleeping, mark this message as timed out
+                if (agentData.state === 'slept') {
+                  setChatMessages(prev => prev.map(msg =>
+                    msg.id === currentChatResponseId
+                      ? { ...msg, response: data, status: 'busy_timeout', agentState: 'slept' }
+                      : msg
+                  ));
+                  setIsChatPolling(false);
+                  setCurrentChatResponseId(null);
+                  clearInterval(interval);
+                  return;
+                }
+              }
+            } catch (stateErr) {
+              console.error('[UniTest Chat] Error checking agent state:', stateErr);
+            }
+          }
+
+          // Update the chat message with the response
+          setChatMessages(prev => prev.map(msg =>
+            msg.id === currentChatResponseId
+              ? { ...msg, response: data, status: data.status }
+              : msg
+          ));
+
+          if (isTerminal(data.status)) {
+            setIsChatPolling(false);
+            setCurrentChatResponseId(null);
+            clearInterval(interval);
+          }
+        }
+      } catch (err) {
+        if (!cancelled) {
+          console.error('[UniTest Chat] Polling error', err);
+        }
+      }
+    }, 3000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [derivedAgentName, currentChatResponseId, isChatPolling]);
+
+  // Handle chat submission
+  const handleChatSubmit = async (e) => {
+    e.preventDefault();
+    if (!chatInput.trim() || isSendingChat || !derivedAgentName) return;
+
+    const userMessage = chatInput.trim();
+    setChatInput('');
+    setIsSendingChat(true);
+
+    // Add user message to chat
+    const userMsgId = Date.now().toString();
+    setChatMessages(prev => [...prev, {
+      id: userMsgId,
+      type: 'user',
+      content: userMessage,
+      timestamp: new Date().toISOString()
+    }]);
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agentName: derivedAgentName,
+          message: userMessage
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error('Failed to send message');
+      }
+
+      const chatResponse = await res.json();
+
+      // Add agent message placeholder to chat
+      setChatMessages(prev => [...prev, {
+        id: chatResponse.id,
+        type: 'agent',
+        content: userMessage,
+        timestamp: new Date().toISOString(),
+        response: chatResponse,
+        status: chatResponse.status
+      }]);
+
+      // Start polling for this response
+      setCurrentChatResponseId(chatResponse.id);
+      setIsChatPolling(true);
+    } catch (error) {
+      console.error('[UniTest Chat] Error sending message:', error);
+      setChatMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        type: 'error',
+        content: 'Failed to send message. Please try again.',
+        timestamp: new Date().toISOString()
+      }]);
+    } finally {
+      setIsSendingChat(false);
+    }
+  };
 
   const status = (response?.status || 'pending').toLowerCase();
   const commentary = useMemo(() => {
@@ -187,30 +437,40 @@ export default function RepoTestPage({ owner, name, repoUrl, agentName, response
       <div className="test-page-header">
         <Link href="/" className="test-brand-link">
           <span className="test-brand-text">UniTest</span>
-          <span className="test-brand-separator">·</span>
-          <span className="test-brand-subtitle">RemoteAgent</span>
+          <span className="test-brand-separator">×</span>
+          <span className="test-brand-subtitle">
+            <img alt="RemoteAgent" className="remoteagent-logo" src="https://dev-cloud.remoteagent.com/favicon-32x32.png" />
+            <span className="remoteagent-text">RemoteAgent</span>
+          </span>
         </Link>
       </div>
 
       <div className="test-card">
         <div className="repo-summary">
           <div className="repo-header">
-            <h1 className="repo-title">
-              <span className="repo-title__segment">{owner}</span>
-              <span className="repo-title__slash">/</span>
-              <span className="repo-title__segment repo-title__segment--repo">
-                {name}
-                <a
-                  href={repoUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="repo-title__arrow"
-                  title="View on GitHub"
-                >
-                  ↗
-                </a>
-              </span>
-            </h1>
+            <div className="repo-title-container">
+              <svg className="github-icon" viewBox="0 0 16 16" width="28" height="28" aria-hidden="true">
+                <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path>
+              </svg>
+              <h1 className="repo-title">
+                <span className="repo-title__owner">{owner}</span>
+                <span className="repo-title__slash">/</span>
+                <span className="repo-title__name">{name}</span>
+              </h1>
+              <a
+                href={repoUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="repo-link-button"
+                title="View on GitHub"
+              >
+                <svg viewBox="0 0 16 16" width="14" height="14">
+                  <path d="M3.75 2A1.75 1.75 0 002 3.75v8.5c0 .966.784 1.75 1.75 1.75h8.5A1.75 1.75 0 0014 12.25v-3.5a.75.75 0 00-1.5 0v3.5a.25.25 0 01-.25.25h-8.5a.25.25 0 01-.25-.25v-8.5a.25.25 0 01.25-.25h3.5a.75.75 0 000-1.5h-3.5z"></path>
+                  <path d="M10.75 2a.75.75 0 000 1.5h1.69L7.22 8.72a.75.75 0 101.06 1.06l5.22-5.22v1.69a.75.75 0 001.5 0V2h-4.25z"></path>
+                </svg>
+                View Repository
+              </a>
+            </div>
           </div>
 
           {repoStats?.description && (
@@ -242,6 +502,100 @@ export default function RepoTestPage({ owner, name, repoUrl, agentName, response
               </p>
             )}
             {!isFailed && !isCancelled && renderOutputItems(outputItems)}
+          </section>
+        )}
+
+        {isTerminal(status) && !isFailed && !isCancelled && (
+          <section className="chat-section">
+            <div className="chat-header">
+              <h2 className="chat-title">Ask Follow-up Questions</h2>
+              <p className="chat-subtitle">Continue the conversation with the test agent</p>
+            </div>
+
+            {chatMessages.length > 0 && (
+              <div className="chat-messages">
+                {chatMessages.map((msg) => {
+                  if (msg.type === 'user') {
+                    return (
+                      <div key={msg.id} className="chat-message chat-message--user">
+                        <div className="chat-message__label">You</div>
+                        <div className="chat-message__content">{msg.content}</div>
+                      </div>
+                    );
+                  }
+
+                  if (msg.type === 'agent') {
+                    const agentStatus = msg.status || 'pending';
+                    const isAgentTerminal = isTerminal(agentStatus) || agentStatus === 'busy_timeout';
+                    const agentOutputItems = isAgentTerminal && msg.response?.output_content
+                      ? msg.response.output_content
+                      : [];
+
+                    const isBusyTimeout = agentStatus === 'busy_timeout' || msg.agentState === 'slept';
+
+                    return (
+                      <div key={msg.id} className="chat-message chat-message--agent">
+                        <div className="chat-message__label">Agent</div>
+                        <div className="chat-message__content">
+                          {!isAgentTerminal && (
+                            <p className="chat-message__thinking">
+                              {formatCommentary(extractLatestCommentary(msg.response?.segments)) || 'Thinking...'}
+                            </p>
+                          )}
+                          {isBusyTimeout && (
+                            <div className="chat-message__timeout">
+                              <p style={{ margin: 0, fontWeight: 600, color: 'var(--accent-rose)' }}>⏱️ Agent Busy Timeout</p>
+                              <p style={{ margin: '0.75rem 0 0', fontSize: '0.9rem', lineHeight: 1.5 }}>
+                                The agent was busy with another task and couldn't respond in time. The agent has now gone to sleep to conserve resources.
+                              </p>
+                              <p style={{ margin: '0.5rem 0 0', fontSize: '0.9rem', lineHeight: 1.5 }}>
+                                Please try your question again, or generate a new test to wake the agent.
+                              </p>
+                            </div>
+                          )}
+                          {isAgentTerminal && agentStatus === 'failed' && !isBusyTimeout && (
+                            <p className="chat-message__error">Failed to process your message.</p>
+                          )}
+                          {isAgentTerminal && agentStatus === 'completed' && !isBusyTimeout && (
+                            <div className="chat-message__output">
+                              {renderOutputItems(agentOutputItems, true)}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  if (msg.type === 'error') {
+                    return (
+                      <div key={msg.id} className="chat-message chat-message--error">
+                        <div className="chat-message__content">{msg.content}</div>
+                      </div>
+                    );
+                  }
+
+                  return null;
+                })}
+              </div>
+            )}
+
+            <form onSubmit={handleChatSubmit} className="chat-input-form">
+              <input
+                type="text"
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                placeholder="Ask about the tests, coverage, or request changes..."
+                className="chat-input"
+                disabled={isSendingChat || isChatPolling}
+              />
+              <button
+                type="submit"
+                className="chat-submit"
+                disabled={!chatInput.trim() || isSendingChat || isChatPolling}
+              >
+                {isSendingChat ? 'Sending...' : 'Send'}
+              </button>
+            </form>
           </section>
         )}
 

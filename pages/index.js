@@ -111,7 +111,10 @@ export default function Home() {
     <main>
       <section className="hero">
         <h1>UniTest</h1>
-        <p className="tagline">RemoteAgent Showcase</p>
+        <p className="tagline">
+          <img alt="RemoteAgent" className="tagline-logo" src="https://dev-cloud.remoteagent.com/favicon-32x32.png" />
+          RemoteAgent Showcase
+        </p>
 
         <form className="input-row" onSubmit={handleSubmit}>
           <input

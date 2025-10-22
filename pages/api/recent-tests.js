@@ -39,10 +39,8 @@ export default async function handler(req, res) {
     const agentsData = await agentsRes.json();
     const agents = Array.isArray(agentsData.items) ? agentsData.items : [];
 
-    // For each agent, get the latest completed response
-    const recentTests = [];
-
-    for (const agent of agents) {
+    // For each agent, get the latest completed response - fetch in parallel
+    const responsePromises = agents.map(async (agent) => {
       try {
         const responsesRes = await fetch(`${host}/api/v0/agents/${encodeURIComponent(agent.name)}/responses?limit=10`, {
           headers: {
@@ -63,7 +61,7 @@ export default async function handler(req, res) {
               // Extract repository info from metadata
               const repo = agent.metadata?.repository;
               if (repo?.owner && repo?.name) {
-                recentTests.push({
+                return {
                   owner: repo.owner,
                   name: repo.name,
                   url: repo.url,
@@ -72,7 +70,7 @@ export default async function handler(req, res) {
                   status: latest.status,
                   createdAt: latest.created_at,
                   updatedAt: latest.updated_at
-                });
+                };
               }
             }
           }
@@ -80,10 +78,18 @@ export default async function handler(req, res) {
       } catch (err) {
         console.error(`[UniTest] Failed to fetch responses for agent ${agent.name}:`, err);
       }
-    }
+      return null;
+    });
+
+    // Wait for all requests to complete in parallel
+    const results = await Promise.all(responsePromises);
+    const recentTests = results.filter(test => test !== null);
 
     // Sort by most recent first
     recentTests.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+
+    // Cache for 30 seconds to reduce API load
+    res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
 
     return res.status(200).json({ tests: recentTests.slice(0, 20) }); // Return top 20
   } catch (error) {
